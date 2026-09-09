@@ -29,12 +29,16 @@ def upgrade() -> None:
         "UPDATE projects SET status = 'En cours' "
         "WHERE status NOT IN ('En attente', 'En cours', 'Terminé')"
     )
-    op.create_check_constraint(
-        "ck_projects_status",
-        "projects",
-        sa.column("status").in_(_ALLOWED_STATUSES),
-    )
+    # `batch_alter_table` : sur PostgreSQL c'est un simple ALTER TABLE ADD
+    # CONSTRAINT ; sur SQLite (dev/tests local) Alembic recrée la table, car
+    # SQLite ne sait pas ajouter une contrainte a posteriori.
+    with op.batch_alter_table("projects") as batch_op:
+        batch_op.create_check_constraint(
+            "ck_projects_status",
+            sa.column("status").in_(_ALLOWED_STATUSES),
+        )
 
 
 def downgrade() -> None:
-    op.drop_constraint("ck_projects_status", "projects", type_="check")
+    with op.batch_alter_table("projects") as batch_op:
+        batch_op.drop_constraint("ck_projects_status", type_="check")

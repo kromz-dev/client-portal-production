@@ -66,12 +66,24 @@ require_cmd() {
     fi
 }
 
+# Dependance non bloquante : absente, on avertit seulement (utile en local).
+AGE_AVAILABLE=true
+optional_cmd() {
+    local cmd="$1" hint="$2"
+    if ! command -v "$cmd" &>/dev/null; then
+        log WARN "Optionnel absent : '${cmd}'  ->  ${hint}"
+        return 1
+    fi
+    log OK "Present : ${cmd}"
+    return 0
+}
+
 require_cmd docker      "installer Docker Engine : https://docs.docker.com/engine/install/debian/"
-require_cmd age         "sudo apt-get install -y age"
-require_cmd age-keygen  "sudo apt-get install -y age"
-require_cmd shred       "sudo apt-get install -y coreutils"
 require_cmd curl        "sudo apt-get install -y curl"
 require_cmd tar         "sudo apt-get install -y tar"
+optional_cmd shred      "sudo apt-get install -y coreutils"
+optional_cmd age        "sudo apt-get install -y age (requis pour CHIFFRER les sauvegardes)"       || AGE_AVAILABLE=false
+optional_cmd age-keygen "sudo apt-get install -y age"                                              || AGE_AVAILABLE=false
 
 # Docker Compose : plugin v2 ou binaire v1
 if command -v docker &>/dev/null && docker compose version &>/dev/null; then
@@ -104,6 +116,15 @@ log OK "Repertoires prets : secrets/ (700), backups/ (700), uploads/, docs/mesur
 # 3. Generation de la cle age
 # -----------------------------------------------------------------------------
 AGE_KEY_FILE="${PROJECT_ROOT}/secrets/backup_age.key"
+
+if [[ "$AGE_AVAILABLE" != true ]]; then
+    log WARN "age indisponible : generation de cle ignoree."
+    log WARN "Les sauvegardes seront ecrites EN CLAIR tant que ENVIRONMENT != production."
+    log WARN "Pour chiffrer : sudo apt-get install -y age puis relancez ce script."
+    echo ""
+    echo -e "${BOLD}Prochaine commande :${NC} docker compose -f docker-compose.yml up -d --build"
+    exit 0
+fi
 
 if [[ -f "$AGE_KEY_FILE" ]]; then
     log INFO "Une identite age existe deja : ${AGE_KEY_FILE} (non modifiee)."

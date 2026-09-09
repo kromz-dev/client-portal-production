@@ -1,0 +1,35 @@
+# =============================================================================
+# docker-compose.override.yml — surcouche de DÉVELOPPEMENT LOCAL
+# =============================================================================
+# Fusionné automatiquement par `docker compose` par-dessus docker-compose.yml
+# dès qu'on lance une commande `docker compose` sans `-f`.
+#
+# ⚠️ PRODUCTION : la pile y est démarrée par `portail-client.service`, qui passe
+# `-f docker-compose.yml` explicitement — ce fichier est donc ignoré. Si tu
+# opères la prod à la main, fais de même : `docker compose -f docker-compose.yml …`
+# (ou supprime ce fichier de la machine de prod).
+#
+# Rôle : rendre l'API et la base joignables depuis l'hôte pour le confort de
+# développement (curl, psql, serveur Vite `npm run dev`, client SQL graphique).
+# Les ports sont liés à 127.0.0.1 uniquement : rien n'est exposé sur le réseau.
+# =============================================================================
+services:
+  db:
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  backend:
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      ENVIRONMENT: development
+
+    # --- Rechargement à chaud (optionnel) --------------------------------------
+    # Décommenter pour que l'API redémarre à chaque modification de ./backend.
+    # Note : le conteneur tourne en uid 10001 ; les fichiers .pyc créés dans
+    # ./backend appartiendront à cet uid. `git clean -fdx backend` au besoin.
+    #
+    # entrypoint: ["sh", "-c", "alembic upgrade head && exec uvicorn main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips=* --reload"]
+    # volumes:
+    #   - ./backend:/app
+    #   - ./uploads:/uploads

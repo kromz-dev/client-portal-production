@@ -36,3 +36,8 @@ uploads.pre-restore_*
 # Mesures / relevés générés localement (on garde seulement le .gitkeep)
 docs/mesures/*
 !docs/mesures/.gitkeep
+
+# Dev local sans Docker (run-local.sh)
+.local-libs/
+.secret-local
+portail_local.db

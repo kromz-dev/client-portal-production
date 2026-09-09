@@ -37,6 +37,11 @@ HELP_INVOKED=false
 DB_PLAINTEXT=""
 UPLOADS_PLAINTEXT=""
 
+# Artefacts finaux effectivement conserves (chiffres .age OU en clair selon le
+# mode) : renseignes pour le rapport de synthese.
+DB_FINAL_FILE=""
+UPLOADS_FINAL_FILE=""
+
 # Piege de sortie / nettoyage
 cleanup() {
     local exit_code=$?
@@ -103,16 +108,24 @@ POSTGRES_DB="${POSTGRES_DB:-portail_client}"
 POSTGRES_CONTAINER="${POSTGRES_CONTAINER:-portail_db}"
 RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-7}"
 
-# Chiffrement obligatoire : destinataire age
+# Chiffrement : obligatoire en production, optionnel ailleurs.
+#   - BACKUP_AGE_RECIPIENT renseigne  -> chiffrement age (binaire 'age' requis)
+#   - vide + ENVIRONMENT=production    -> erreur (aucune sauvegarde en clair en prod)
+#   - vide + hors production           -> sauvegarde NON chiffree (toleree en local)
+ENCRYPT=true
 if [[ -z "${BACKUP_AGE_RECIPIENT:-}" ]]; then
-    log ERROR "BACKUP_AGE_RECIPIENT n'est pas defini dans .env."
-    log ERROR "Aucune sauvegarde en clair ne sera produite."
-    log ERROR "Executez d'abord : ./scripts/install.sh (genere la cle et affiche la cle publique age1...)."
-    exit 1
+    if [[ "${ENVIRONMENT:-production}" == "production" ]]; then
+        log ERROR "BACKUP_AGE_RECIPIENT n'est pas defini dans .env (obligatoire en production)."
+        log ERROR "Executez d'abord : ./scripts/install.sh (genere la cle et affiche la cle publique age1...)."
+        exit 1
+    fi
+    ENCRYPT=false
+    log WARN "BACKUP_AGE_RECIPIENT vide et ENVIRONMENT != production :"
+    log WARN "les sauvegardes seront ecrites EN CLAIR (mode local uniquement)."
 fi
 
-# Binaire age requis
-if ! command -v age &>/dev/null; then
+# Binaire age requis uniquement si l'on chiffre
+if [[ "$ENCRYPT" == true ]] && ! command -v age &>/dev/null; then
     log ERROR "Le binaire 'age' est introuvable. Installez-le : sudo apt-get install -y age"
     exit 1
 fi
@@ -169,28 +182,37 @@ if [[ "$HEADER" != "PGDMP" ]]; then
 fi
 log OK "Dump de la base valide (entete PGDMP)."
 
-# Chiffrement avec la cle publique age
-log INFO "Chiffrement du dump avec age -> $(basename "$DB_ENC_FILE")"
-rm -f "$DB_ENC_FILE"
-age -r "$BACKUP_AGE_RECIPIENT" -o "$DB_ENC_FILE" "$DB_DUMP_FILE"
-rm -f "$DB_DUMP_FILE"
-DB_PLAINTEXT=""
-
-# Verification de l'artefact chiffre
-if [[ ! -s "$DB_ENC_FILE" ]]; then
-    log ERROR "Le fichier chiffre est vide : ${DB_ENC_FILE}"
+if [[ "$ENCRYPT" == true ]]; then
+    # Chiffrement avec la cle publique age
+    log INFO "Chiffrement du dump avec age -> $(basename "$DB_ENC_FILE")"
     rm -f "$DB_ENC_FILE"
-    exit 1
-fi
-ENC_HEADER=$(head -c 21 "$DB_ENC_FILE" || true)
-if [[ "$ENC_HEADER" != "age-encryption.org/v1" ]]; then
-    log ERROR "L'entete du fichier chiffre n'est pas 'age-encryption.org/v1' (obtenu '$ENC_HEADER')."
-    rm -f "$DB_ENC_FILE"
-    exit 1
-fi
+    age -r "$BACKUP_AGE_RECIPIENT" -o "$DB_ENC_FILE" "$DB_DUMP_FILE"
+    rm -f "$DB_DUMP_FILE"
+    DB_PLAINTEXT=""
 
-DB_SIZE=$(du -h "$DB_ENC_FILE" | cut -f1)
-log OK "Sauvegarde de la base chiffree et verifiee : ${DB_ENC_FILE} (${DB_SIZE})"
+    # Verification de l'artefact chiffre
+    if [[ ! -s "$DB_ENC_FILE" ]]; then
+        log ERROR "Le fichier chiffre est vide : ${DB_ENC_FILE}"
+        rm -f "$DB_ENC_FILE"
+        exit 1
+    fi
+    ENC_HEADER=$(head -c 21 "$DB_ENC_FILE" || true)
+    if [[ "$ENC_HEADER" != "age-encryption.org/v1" ]]; then
+        log ERROR "L'entete du fichier chiffre n'est pas 'age-encryption.org/v1' (obtenu '$ENC_HEADER')."
+        rm -f "$DB_ENC_FILE"
+        exit 1
+    fi
+
+    DB_FINAL_FILE="$DB_ENC_FILE"
+    DB_SIZE=$(du -h "$DB_ENC_FILE" | cut -f1)
+    log OK "Sauvegarde de la base chiffree et verifiee : ${DB_ENC_FILE} (${DB_SIZE})"
+else
+    # Pas de chiffrement : on conserve le dump en clair tel quel.
+    DB_PLAINTEXT=""   # ne pas laisser le piege EXIT supprimer un artefact valide
+    DB_FINAL_FILE="$DB_DUMP_FILE"
+    DB_SIZE=$(du -h "$DB_DUMP_FILE" | cut -f1)
+    log OK "Sauvegarde de la base (NON chiffree) : ${DB_DUMP_FILE} (${DB_SIZE})"
+fi
 
 # -----------------------------------------------------------------------------
 # 4. Sauvegarde du volume uploads puis chiffrement
@@ -205,26 +227,34 @@ if [[ -d "$UPLOADS_DIR" ]]; then
     tar -czf "$UPLOADS_TAR_FILE" -C "$PROJECT_ROOT" uploads
 
     if [[ -s "$UPLOADS_TAR_FILE" ]]; then
-        log INFO "Chiffrement de l'archive uploads avec age -> $(basename "$UPLOADS_ENC_FILE")"
-        rm -f "$UPLOADS_ENC_FILE"
-        age -r "$BACKUP_AGE_RECIPIENT" -o "$UPLOADS_ENC_FILE" "$UPLOADS_TAR_FILE"
-        rm -f "$UPLOADS_TAR_FILE"
-        UPLOADS_PLAINTEXT=""
-
-        if [[ ! -s "$UPLOADS_ENC_FILE" ]]; then
-            log ERROR "L'archive uploads chiffree est vide : ${UPLOADS_ENC_FILE}"
+        if [[ "$ENCRYPT" == true ]]; then
+            log INFO "Chiffrement de l'archive uploads avec age -> $(basename "$UPLOADS_ENC_FILE")"
             rm -f "$UPLOADS_ENC_FILE"
-            exit 1
-        fi
-        UP_ENC_HEADER=$(head -c 21 "$UPLOADS_ENC_FILE" || true)
-        if [[ "$UP_ENC_HEADER" != "age-encryption.org/v1" ]]; then
-            log ERROR "L'entete de l'archive uploads chiffree n'est pas 'age-encryption.org/v1' (obtenu '$UP_ENC_HEADER')."
-            rm -f "$UPLOADS_ENC_FILE"
-            exit 1
-        fi
+            age -r "$BACKUP_AGE_RECIPIENT" -o "$UPLOADS_ENC_FILE" "$UPLOADS_TAR_FILE"
+            rm -f "$UPLOADS_TAR_FILE"
+            UPLOADS_PLAINTEXT=""
 
-        UPLOADS_SIZE=$(du -h "$UPLOADS_ENC_FILE" | cut -f1)
-        log OK "Archive uploads chiffree et verifiee : ${UPLOADS_ENC_FILE} (${UPLOADS_SIZE})"
+            if [[ ! -s "$UPLOADS_ENC_FILE" ]]; then
+                log ERROR "L'archive uploads chiffree est vide : ${UPLOADS_ENC_FILE}"
+                rm -f "$UPLOADS_ENC_FILE"
+                exit 1
+            fi
+            UP_ENC_HEADER=$(head -c 21 "$UPLOADS_ENC_FILE" || true)
+            if [[ "$UP_ENC_HEADER" != "age-encryption.org/v1" ]]; then
+                log ERROR "L'entete de l'archive uploads chiffree n'est pas 'age-encryption.org/v1' (obtenu '$UP_ENC_HEADER')."
+                rm -f "$UPLOADS_ENC_FILE"
+                exit 1
+            fi
+
+            UPLOADS_FINAL_FILE="$UPLOADS_ENC_FILE"
+            UPLOADS_SIZE=$(du -h "$UPLOADS_ENC_FILE" | cut -f1)
+            log OK "Archive uploads chiffree et verifiee : ${UPLOADS_ENC_FILE} (${UPLOADS_SIZE})"
+        else
+            UPLOADS_PLAINTEXT=""   # artefact valide : le piege EXIT ne doit pas y toucher
+            UPLOADS_FINAL_FILE="$UPLOADS_TAR_FILE"
+            UPLOADS_SIZE=$(du -h "$UPLOADS_TAR_FILE" | cut -f1)
+            log OK "Archive uploads (NON chiffree) : ${UPLOADS_TAR_FILE} (${UPLOADS_SIZE})"
+        fi
     else
         log WARN "L'archive uploads a ete creee mais elle est vide. Suppression."
         rm -f "$UPLOADS_TAR_FILE"
@@ -268,14 +298,22 @@ BACKUP_COUNT=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "*.age" -o -name 
 echo -e "\n${BOLD}======================================================${NC}"
 echo -e "${BOLD}            Rapport de synthese - Sauvegarde           ${NC}"
 echo -e "${BOLD}======================================================${NC}"
-echo "  - Dump base (chiffre) : ${DB_ENC_FILE} (${DB_SIZE})"
-if [[ -f "$UPLOADS_ENC_FILE" ]]; then
-echo "  - Archive uploads (chiffree) : ${UPLOADS_ENC_FILE} (${UPLOADS_SIZE:-?})"
+if [[ "$ENCRYPT" == true ]]; then
+echo "  - Dump base (chiffre) : ${DB_FINAL_FILE} (${DB_SIZE})"
+else
+echo "  - Dump base (EN CLAIR) : ${DB_FINAL_FILE} (${DB_SIZE})"
+fi
+if [[ -n "$UPLOADS_FINAL_FILE" && -f "$UPLOADS_FINAL_FILE" ]]; then
+echo "  - Archive uploads : ${UPLOADS_FINAL_FILE} (${UPLOADS_SIZE:-?})"
 fi
 echo "  - Total archives : ${BACKUP_COUNT} fichiers dans ${BACKUP_DIR}"
 echo "  - Espace disque total : ${TOTAL_BACKUPS_SIZE}"
 echo "  - Fenetre de retention : ${RETENTION_DAYS} jours"
+if [[ "$ENCRYPT" == true ]]; then
 echo "  - Chiffrement : age (X25519), destinataire ${BACKUP_AGE_RECIPIENT}"
 echo -e "  ${YELLOW}Rappel : la restauration exige l'identite privee age"
 echo -e "  (secrets/backup_age.key). Sans elle, AUCUNE sauvegarde n'est recuperable.${NC}"
+else
+echo -e "  ${YELLOW}Chiffrement : DESACTIVE (mode local). Ne pas utiliser tel quel en production.${NC}"
+fi
 echo -e "${BOLD}======================================================${NC}\n"
