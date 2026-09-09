@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     upload_dir: str = "/uploads"
     app_version: str = "1.0.0"
 
+    # Amorçage du compte prestataire (administrateur) au démarrage.
+    # Si l'email correspond à un compte existant, celui-ci est promu `admin` ;
+    # sinon, si le mot de passe est aussi fourni, le compte est créé.
+    bootstrap_admin_email: str = ""
+    bootstrap_admin_password: str = ""
+
     @model_validator(mode="after")
     def _validate_environment(self) -> "Settings":
         if self.environment == "production":

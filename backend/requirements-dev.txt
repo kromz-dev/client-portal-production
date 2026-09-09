@@ -1,0 +1,5 @@
+# Dépendances de test uniquement (non installées dans l'image de production).
+# Installation dans le dossier autonome .local-libs :
+#   PYTHONPATH=.local-libs python3 -m pip install --target=.local-libs -r backend/requirements-dev.txt
+pytest==8.3.2
+httpx==0.28.1

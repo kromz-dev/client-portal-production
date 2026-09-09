@@ -5,7 +5,7 @@
 **Auteur :** Solution Architect & Production Engineer  
 **Date de révision :** Septembre 2026  
 **Cycle de revue :** Trimestriel / Après incident majeur  
-**Statut :** Validé en conditions réelles  
+**Statut :** Pile fonctionnelle en local — métriques SLA à relever avant mise en production (voir §1.1)  
 
 ---
 
@@ -15,13 +15,19 @@ Ce Runbook fournit toutes les procédures d'exploitation, de maintenance, de dia
 
 ### 1.1 Objectifs de Niveau de Service (SLA / SLO)
 
+> **⚠️ Mesures en attente.** La colonne « Mesure réelle » n'est PAS encore
+> remplie : la pile n'a pas été déployée publiquement ni chronométrée. Lancer
+> `./scripts/mesures.sh` sur la machine cible, committer le rapport dans
+> `docs/mesures/`, puis reporter les valeurs ci-dessous. Tant que ce n'est pas
+> fait, ne pas présenter ces chiffres à un client.
+
 | Métrique | Engagement Opérationnel (Cible) | Mesure Réelle Constatée |
 | :--- | :--- | :--- |
-| **Disponibilité globale** | 99.9% (max 43 min d'arrêt/mois) | 99.95% |
-| **RTO (Recovery Time Objective)** | < 5 minutes | 45 secondes (reboot) / 1m 40s (restauration DB) |
-| **RPO (Recovery Point Objective)** | < 24 heures | Sauvegarde quotidienne à 02:00 UTC |
-| **Temps de démarrage à froid** | < 60 secondes | 22 secondes (`docker compose up -d`) |
-| **Coût d'infrastructure récurrent** | 0,00 € / mois | 0,00 € (Let's Encrypt + DuckDNS + Matériel dédié) |
+| **Disponibilité globale** | 99.9% (max 43 min d'arrêt/mois) | _à mesurer_ |
+| **RTO (Recovery Time Objective)** | < 5 minutes | _à mesurer (`mesures.sh` : reprise + restauration)_ |
+| **RPO (Recovery Point Objective)** | < 24 heures | Sauvegarde quotidienne à 02:00 (timer `portail-backup.timer`, `Persistent=true`) |
+| **Temps de démarrage à froid** | < 60 secondes | _à mesurer (`mesures.sh` : démarrage à froid)_ |
+| **Coût d'infrastructure récurrent** | 0,00 € / mois | 0,00 € (Let's Encrypt + DuckDNS/Tailscale + matériel existant) |
 
 ---
 
@@ -80,9 +86,15 @@ L'application repose sur une pile 100% conteneurisée avec isolation réseau et 
 
 | Service Docker | Rôle & Technologie | Ports Internes | Exposition Publique | Volume Persistant |
 | :--- | :--- | :--- | :--- | :--- |
-| `caddy` | Reverse Proxy & Serveur Statique SPA, TLS Let's Encrypt auto | 80, 443 | Oui (Ports 80/443 hôte) | `caddy_data`, `caddy_config`, `./frontend/dist` |
-| `backend` | API REST FastAPI, Python 3.11, Uvicorn | 8000 | Non (Réseau privé `frontend_net` + `backend_net`) | `./uploads` |
-| `db` | Base relationnelle PostgreSQL 16 Alpine | 5432 | **Non (Strictement isolé sur `backend_net`)** | `pgdata` |
+| `caddy` | Reverse proxy & TLS Let's Encrypt auto, en-têtes de sécurité | 80, 443 | Oui (ports 80/443 hôte) | `caddy_data`, `caddy_config` |
+| `web` | SPA React compilée, servie par Nginx 1.27 Alpine | 80 | Non (réseau `frontend_net` uniquement) | — (image immuable) |
+| `backend` | API REST FastAPI, Python 3.11, Uvicorn, migrations Alembic au démarrage | 8000 | Non (réseaux `frontend_net` + `backend_net`) | `./uploads` |
+| `db` | Base relationnelle PostgreSQL 16 Alpine | 5432 | **Non (strictement isolé sur `backend_net` en `internal: true`)** | `pgdata` |
+
+> En développement local, `docker-compose.override.yml` publie en plus
+> `backend` sur `127.0.0.1:8000` et `db` sur `127.0.0.1:5432`. Ce fichier n'est
+> pas utilisé en production (la pile y est lancée avec `-f docker-compose.yml`
+> explicitement, cf. l'unité `portail-client.service`).
 
 ---
 
@@ -90,39 +102,49 @@ L'application repose sur une pile 100% conteneurisée avec isolation réseau et 
 
 ### 3.1 Prérequis Système
 - Système d'exploitation : Linux (Debian 12 / Ubuntu 22.04+ recommandé).
-- Docker Engine version 24.0+ et Docker Compose v2 (plugin `docker compose`).
-- Ports 80 et 443 ouverts et routés vers la machine hôte.
-- Domaine ou sous-domaine DuckDNS pointant vers l'adresse IP publique de la machine.
+- Docker Engine 24.0+ et Docker Compose v2 (plugin `docker compose`).
+- `age` (`apt-get install -y age`) pour le chiffrement des sauvegardes.
+- Ports 80 et 443 ouverts et routés vers la machine hôte (ou Tailscale Funnel si CGNAT — voir `scripts/check_cgnat.sh`).
+- Domaine / sous-domaine DuckDNS pointant vers l'IP publique.
+- **Pour un essai purement local :** voir `QUICKSTART.md` (aucun domaine ni port ouvert requis).
 
 ### 3.2 Fichier d'Environnement `.env`
-Avant le lancement, s'assurer de la présence du fichier `.env` à la racine du projet :
+
+Partir de `.env.example` (`cp .env.example .env`) et renseigner toutes les
+clés. Champs sensibles à générer, jamais réutiliser les exemples :
 
 ```ini
-# --- Environnement de Production ---
-POSTGRES_USER=postgres
-POSTGRES_PASSWORD=CHANGEME_SECURE_PASSWORD_POSTGRES_2026
+POSTGRES_USER=portail
+POSTGRES_PASSWORD=<openssl rand -hex 16>
 POSTGRES_DB=portail_client
 POSTGRES_HOST=db
 POSTGRES_PORT=5432
 
-# Configuration API
-SECRET_KEY=CHANGEME_SUPER_SECRET_JWT_KEY_HEX64_SECURITY
-ENVIRONMENT=production
-
-# Domaine Public
+SECRET_KEY=<openssl rand -hex 32>       # 32 caractères minimum, sinon l'API refuse de démarrer en prod
+ENVIRONMENT=production                   # active les validations strictes (clé, DATABASE_URL, CORS sans `*`)
+CORS_ORIGINS=https://mon-portail-client.duckdns.org
 DOMAIN_NAME=mon-portail-client.duckdns.org
+CADDY_EMAIL=admin@exemple.fr             # notifications d'expiration Let's Encrypt
+
+MAX_UPLOAD_BYTES=10485760
+ACCESS_TOKEN_EXPIRE_MINUTES=1440
+APP_VERSION=1.0.0
+
+BACKUP_RETENTION_DAYS=7
+BACKUP_AGE_RECIPIENT=age1...             # clé publique affichée par ./scripts/install.sh
+BACKUP_AGE_IDENTITY=/opt/portail_client/secrets/backup_age.key
 ```
 
 ### 3.3 Lancement Complet de la Pile
 
-Pour démarrer l'ensemble des services en arrière-plan avec reconstruction des images :
-
 ```bash
-# 1. Se positionner dans le répertoire du projet
-cd /home/Kram/Bureau/portail_client
+cd /opt/portail_client
 
-# 2. Lancer la pile complète
-docker compose up -d --build
+# Première fois : prépare l'hôte (dépendances, dossiers, clé age de sauvegarde)
+./scripts/install.sh
+
+# Démarre la pile (production : -f explicite, ignore docker-compose.override.yml)
+docker compose -f docker-compose.yml up -d --build
 ```
 
 ### 3.4 Vérification Immédiate (Smoke Tests)
@@ -314,103 +336,101 @@ curl -I https://mon-portail-client.duckdns.org/health
 ## 6. Sauvegarde & Plan de Reprise d'Activité (Disaster Recovery)
 
 ### 6.1 Stratégie de Sauvegarde
-- **Fréquence :** Quotidienne, chaque nuit à 02:00.
-- **Contenu :** Dump SQL complet de la base PostgreSQL compressé avec `gzip`.
-- **Rétention :** 7 jours glissants en local, suppression automatique des archives plus anciennes.
+- **Fréquence :** quotidienne à 02:00 (heure locale de l'hôte), via `portail-backup.timer`.
+- **Contenu :** dump PostgreSQL au format personnalisé (`pg_dump -Fc`, compressé) **+** archive `tar.gz` du répertoire `uploads/`.
+- **Chiffrement :** chaque artefact est chiffré avec `age` (X25519) — clé publique dans `BACKUP_AGE_RECIPIENT`. Aucune sauvegarde en clair ne subsiste. En `ENVIRONMENT != production` sans clé, les archives sont écrites en clair (toléré en local).
+- **Emplacement :** `./backups/` (permissions 0700).
+- **Rétention :** `BACKUP_RETENTION_DAYS` jours glissants (défaut 7), rotation automatique.
 
-### 6.2 Script de Sauvegarde Automatique : `/opt/portail_client/scripts/backup.sh`
+### 6.2 Script de Sauvegarde : `scripts/backup.sh`
 
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-# Configuration
-BACKUP_DIR="/var/backups/portail_client"
-PROJECT_DIR="/home/Kram/Bureau/portail_client"
-DATE=$(date +"%Y-%m-%d_%H%M%S")
-FILENAME="db_backup_${DATE}.sql.gz"
-RETENTION_DAYS=7
-
-mkdir -p "${BACKUP_DIR}"
-
-echo "[$(date)] Début de la sauvegarde de la base de données..."
-
-# Exécution du dump à chaud depuis le conteneur Docker
-docker compose -f "${PROJECT_DIR}/docker-compose.yml" exec -T db \
-    pg_dump -U postgres -d portail_client | gzip > "${BACKUP_DIR}/${FILENAME}"
-
-# Vérification que le fichier existe et n'est pas vide
-if [ -s "${BACKUP_DIR}/${FILENAME}" ]; then
-    echo "[$(date)] Sauvegarde réussie : ${BACKUP_DIR}/${FILENAME} ($(du -h "${BACKUP_DIR}/${FILENAME}" | cut -f1))"
-else
-    echo "[$(date)] ERREUR CRITIQUE : Le fichier de sauvegarde est vide !" >&2
-    exit 1
-fi
-
-# Rotation : suppression des sauvegardes de plus de 7 jours
-find "${BACKUP_DIR}" -name "db_backup_*.sql.gz" -type f -mtime +${RETENTION_DAYS} -delete
-echo "[$(date)] Nettoyage des anciennes sauvegardes (> ${RETENTION_DAYS} jours) effectué."
-```
-
-### 6.3 Configuration Crontab
-
-Pour installer la tâche planifiée automatique sur la machine hôte :
+Le script est versionné dans le dépôt (ne pas le recopier ici). Il effectue :
+dump `-Fc` → validation de l'en-tête `PGDMP` → archive `uploads/` → chiffrement
+`age` → vérification de l'en-tête `age-encryption.org/v1` → rotation → rapport
+horodaté. Un `trap EXIT` garantit qu'aucun intermédiaire en clair ne survit à
+un échec.
 
 ```bash
-# Ouvrir l'éditeur crontab root
-sudo crontab -e
+# Sauvegarde manuelle
+cd /opt/portail_client && ./scripts/backup.sh          # ou : make backup
 
-# Ajouter la ligne suivante :
-0 2 * * * /opt/portail_client/scripts/backup.sh >> /var/log/backup_portail.log 2>&1
+# Vérifier le contenu produit
+ls -lh backups/
 ```
+
+### 6.3 Planification (timer systemd)
+
+La planification passe par systemd (et non cron) : `Persistent=true` rattrape
+une exécution manquée si l'hôte était éteint à 02:00 — c'est ce qui garantit
+réellement le RPO < 24 h.
+
+```bash
+# Installer et activer les unités (portail-client.service, portail-backup.{service,timer})
+sudo ./scripts/install-timers.sh
+
+# Contrôler
+systemctl list-timers portail-backup --all
+journalctl -u portail-backup -n 30 --no-pager
+```
+
+> Les unités codent en dur `/opt/portail_client`. Si le projet est ailleurs,
+> éditer `deploy/systemd/*.service` avant `install-timers.sh`.
 
 ---
 
-### 6.4 Procédure Testée de Restauration d'Urgence
+### 6.4 Procédure de Restauration : `scripts/restore.sh`
 
 > [!CAUTION]
-> Cette opération écrase la base de données en cours. Ne l'exécuter qu'en cas de sinistre ou d'exercice de restauration planifié.
+> Cette opération écrase la base en cours (`pg_restore --clean --if-exists`).
+> À n'exécuter qu'en cas de sinistre ou d'exercice planifié.
 
-**Chronologie de Restauration (validée en moins de 1 minute 40 secondes) :**
+Le script gère la sélection interactive (plus récent d'abord), le
+déchiffrement `age` (via `BACKUP_AGE_IDENTITY`), la validation de l'en-tête
+`PGDMP`, un garde-fou de confirmation (`RESTORE`), la copie de sécurité des
+uploads actuels, puis la vérification post-restauration (`pg_isready` +
+comptage de tables + `/health`).
 
 ```bash
-# 1. Arrêter le trafic applicatif pour éviter les corruptions
-docker compose stop backend
+cd /opt/portail_client
 
-# 2. Identifier le fichier de sauvegarde à restaurer
-ls -lh /var/backups/portail_client/
-BACKUP_FILE="/var/backups/portail_client/db_backup_2026-09-09_020000.sql.gz"
+# Restauration guidée (choix du fichier dans backups/)
+./scripts/restore.sh                    # ou : make restore
 
-# 3. Supprimer et recréer la base de données propre
-docker compose exec -T db psql -U postgres -d postgres -c "DROP DATABASE IF EXISTS portail_client;"
-docker compose exec -T db psql -U postgres -d postgres -c "CREATE DATABASE portail_client OWNER postgres;"
+# Non interactif : dernière sauvegarde, sans confirmation
+./scripts/restore.sh --force
 
-# 4. Injecter le dump compressé dans PostgreSQL
-gunzip -c "${BACKUP_FILE}" | docker compose exec -T db psql -U postgres -d portail_client
+# Fichier précis
+./scripts/restore.sh backups/db_portail_client_20260909_020000.dump.age
+```
 
-# 5. Redémarrer le service backend
-docker compose start backend
+Prérequis : l'identité privée `age` doit être présente à l'emplacement
+`BACKUP_AGE_IDENTITY` (par défaut `secrets/backup_age.key`). **Sans elle,
+aucune sauvegarde chiffrée n'est récupérable.**
 
-# 6. Vérifier le rétablissement immédiat de la base et du service
+Vérification finale :
+
+```bash
 docker compose logs --tail 20 backend
-curl -s https://mon-portail-client.duckdns.org/health | jq .
+curl -sk https://$DOMAIN_NAME/health | jq .
 ```
 
 ---
 
 ## 7. Tableau de Contrôle des Métriques & Recette
 
-Ce tableau récapitule les tests de conformité réalisés sur l'environnement de production.
+Grille de recette à remplir lors du passage en production. **Statut actuel :
+non exécuté** (`docs/mesures/` vide). Lancer `./scripts/mesures.sh`, reboot
+volontaire chronométré, et test 4G, puis cocher.
 
-| Test / Scénario | Procédure de Test | Résultat Attendu | Constaté en Prod | Statut |
+| Test / Scénario | Procédure de Test | Résultat Attendu | Constaté | Statut |
 | :--- | :--- | :--- | :--- | :--- |
-| **Exposition Publique HTTPS** | Requête 4G externe sur `https://[domaine]` | Certificat SSL valide A+, HTTP/2 200 | Réponse en 140ms | **CONFORME** |
-| **Démarrage à Froid** | `docker compose up -d` machine neuve | Tous conteneurs `healthy` | 22 secondes | **CONFORME** |
-| **Reboot Hôte Inopiné** | `sudo reboot` sur le serveur | Reprise intégrale sans intervention humaine | 45 secondes | **CONFORME** |
-| **Crash Conteneur API** | `docker compose kill backend` | Restart auto (`unless-stopped`) en < 5s | Rétabli en 3 secondes | **CONFORME** |
-| **Sauvegarde Quotidienne** | Exécution du script `backup.sh` | Dump `.sql.gz` intègre et non vide | 1,4 Mo généré en 1,8s | **CONFORME** |
-| **Restauration de Secours** | Drop DB puis réinjection du dump | Données intégrales restaurées | 1 min 40 s | **CONFORME** |
-| **Isolation Réseau** | Tentative de connexion externe sur le port 5432 | Connexion bloquée / Port invisible | Refus immédiat (fermé) | **CONFORME** |
+| **Exposition Publique HTTPS** | Requête 4G externe sur `https://[domaine]` | Certificat valide, HTTP/2 200 | _à faire_ | ☐ |
+| **Démarrage à Froid** | `docker compose up -d` sur machine neuve | Tous conteneurs `healthy` | _à faire_ | ☐ |
+| **Reboot Hôte Inopiné** | `sudo reboot` sur le serveur | Reprise intégrale sans intervention | _à faire_ | ☐ |
+| **Crash Conteneur API** | `docker compose kill backend` | Restart auto (`unless-stopped`) | _à faire_ | ☐ |
+| **Sauvegarde Quotidienne** | `./scripts/backup.sh` | Artefacts `.dump.age` + `.tar.gz.age` non vides | _à faire_ | ☐ |
+| **Restauration de Secours** | `./scripts/restore.sh --force` | Données intégrales, `/health` OK | _à faire_ | ☐ |
+| **Isolation Réseau** | Connexion externe sur le port 5432 | Connexion bloquée / port invisible | _à faire_ | ☐ |
 
 ---
 
