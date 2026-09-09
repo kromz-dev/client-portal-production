@@ -1,19 +1,21 @@
+import logging
 import os
-import shutil
 import uuid
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from typing import List
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, status
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import OAuth2PasswordRequestForm
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 from sqlalchemy import text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from auth import create_access_token, get_current_user, get_password_hash, verify_password
-from database import Base, engine, get_db
+from config import settings
+from database import get_db
 from models import Document, Project, User
 from schemas import (
     DocumentResponse,
@@ -26,58 +28,128 @@ from schemas import (
     UserResponse,
 )
 
-UPLOAD_DIR = os.getenv("UPLOAD_DIR", "./uploads")
+logger = logging.getLogger("portail_client.main")
+
+UPLOAD_DIR = settings.upload_dir
 try:
     os.makedirs(UPLOAD_DIR, exist_ok=True)
-except Exception:
-    pass
+except OSError as exc:
+    logger.warning("Impossible de créer le dossier d'uploads %s : %s", UPLOAD_DIR, exc)
 
+# Extensions autorisées pour l'envoi de documents (comparaison insensible à la casse).
+ALLOWED_UPLOAD_EXTENSIONS = {
+    ".pdf",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".gif",
+    ".txt",
+    ".csv",
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".odt",
+    ".ods",
+}
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Ensure database schema is created on startup
-    Base.metadata.create_all(bind=engine)
-    yield
+# Taille des blocs lus lors de l'écriture d'un document envoyé (64 Kio).
+UPLOAD_CHUNK_SIZE = 64 * 1024
 
 
 app = FastAPI(
     title="Portail Client API",
     description="API minimale et robuste pour le portail client",
-    version="1.0.0",
-    lifespan=lifespan,
+    version=settings.app_version,
 )
 
-# CORS configuration
-allowed_origins_raw = os.getenv("CORS_ORIGINS", "*")
-allowed_origins = [orig.strip() for orig in allowed_origins_raw.split(",") if orig.strip()]
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins if "*" not in allowed_origins else ["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ==============================================================================
+# Limitation de débit (slowapi)
+# ==============================================================================
+
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+
+
+def _rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+    return JSONResponse(
+        status_code=429,
+        content={"detail": "Trop de tentatives. Réessayez dans une minute."},
+    )
+
+
+app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
+
+
+# ==============================================================================
+# Configuration CORS
+# ==============================================================================
+
+_cors_origins = settings.cors_origin_list
+if not _cors_origins:
+    # Aucune origine déclarée. En production le SPA est servi par Caddy sur le
+    # même domaine que l'API : le CORS n'a alors aucune raison d'exister, donc on
+    # n'installe pas le middleware du tout (aucune origine tierce autorisée).
+    # En développement, le serveur Vite tourne sur un autre port et a besoin
+    # d'une autorisation large, mais sans identifiants.
+    if settings.environment != "production":
+        logger.warning(
+            "CORS_ORIGINS est vide : toutes les origines sont autorisées "
+            "(mode développement uniquement)."
+        )
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=False,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+elif "*" in _cors_origins:
+    # `*` combiné à des identifiants est invalide et ignoré par les navigateurs.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 # ==============================================================================
 # Health Check
 # ==============================================================================
 
-@app.get("/health", tags=["Health"])
-def health_check(db: Session = Depends(get_db)):
+def _health_payload(db: Session):
+    """Vérifie la connexion à la base et renvoie le corps de réponse /health."""
     try:
         db.execute(text("SELECT 1"))
-        return {
-            "status": "healthy",
-            "database": "connected",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-    except Exception as exc:
-        raise HTTPException(
+    except Exception:
+        logger.exception("Échec de la vérification de santé : base de données injoignable")
+        return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Erreur de connexion base de données: {str(exc)}",
+            content={"status": "unhealthy", "database": "disconnected"},
         )
+    return {
+        "status": "healthy",
+        "database": "connected",
+        "version": settings.app_version,
+    }
+
+
+@app.get("/health", tags=["Health"])
+@app.get("/api/health", tags=["Health"])
+def health_check(db: Session = Depends(get_db)):
+    return _health_payload(db)
 
 
 # ==============================================================================
@@ -85,7 +157,8 @@ def health_check(db: Session = Depends(get_db)):
 # ==============================================================================
 
 @app.post("/api/auth/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED, tags=["Auth"])
-def register(user_in: UserRegister, db: Session = Depends(get_db)):
+@limiter.limit("5/minute")
+def register(request: Request, user_in: UserRegister, db: Session = Depends(get_db)):
     normalized_email = user_in.email.strip().lower()
     existing_user = db.query(User).filter(User.email == normalized_email).first()
     if existing_user:
@@ -105,7 +178,8 @@ def register(user_in: UserRegister, db: Session = Depends(get_db)):
 
 
 @app.post("/api/auth/login", response_model=Token, tags=["Auth"])
-def login(user_in: UserLogin, db: Session = Depends(get_db)):
+@limiter.limit("5/minute")
+def login(request: Request, user_in: UserLogin, db: Session = Depends(get_db)):
     normalized_email = user_in.email.strip().lower()
     user = db.query(User).filter(User.email == normalized_email).first()
     if not user or not verify_password(user_in.password, user.hashed_password):
@@ -120,7 +194,9 @@ def login(user_in: UserLogin, db: Session = Depends(get_db)):
 
 
 @app.post("/api/auth/token", response_model=Token, tags=["Auth"])
+@limiter.limit("5/minute")
 def login_for_access_token(
+    request: Request,
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db),
 ):
@@ -153,6 +229,7 @@ def list_projects(
 ):
     projects = (
         db.query(Project)
+        .options(selectinload(Project.documents))
         .filter(Project.user_id == current_user.id)
         .order_by(Project.created_at.desc())
         .all()
@@ -170,7 +247,7 @@ def create_project(
         user_id=current_user.id,
         title=project_in.title.strip(),
         description=project_in.description.strip() if project_in.description else None,
-        status=project_in.status.strip() if project_in.status else "En cours",
+        status=project_in.status if project_in.status else "En cours",
     )
     db.add(project)
     db.commit()
@@ -220,7 +297,7 @@ def update_project(
     if project_in.description is not None:
         project.description = project_in.description.strip() if project_in.description else None
     if project_in.status is not None:
-        project.status = project_in.status.strip()
+        project.status = project_in.status
 
     db.commit()
     db.refresh(project)
@@ -292,17 +369,50 @@ def upload_document(
 
     # Sanitize and create safe storage filename
     safe_basename = os.path.basename(file.filename)
+    extension = os.path.splitext(safe_basename)[1].lower()
+    if extension not in ALLOWED_UPLOAD_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="Type de fichier non autorisé. Formats acceptés : "
+            "PDF, images, textes et documents bureautiques.",
+        )
+
     unique_prefix = uuid.uuid4().hex[:12]
     stored_name = f"{project_id}_{unique_prefix}_{safe_basename}"
     file_path = os.path.join(UPLOAD_DIR, stored_name)
 
+    max_bytes = settings.max_upload_bytes
+    max_mo = max_bytes / (1024 * 1024)
+    written = 0
     try:
         with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-    except Exception as exc:
+            while True:
+                chunk = file.file.read(UPLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > max_bytes:
+                    buffer.close()
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail=f"Fichier trop volumineux : la taille maximale autorisée "
+                        f"est de {max_mo:.0f} Mo.",
+                    )
+                buffer.write(chunk)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Échec de l'enregistrement du document pour le projet %s", project_id)
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Échec de l'enregistrement du fichier: {str(exc)}",
+            detail="Échec de l'enregistrement du fichier. Veuillez réessayer.",
         )
 
     document = Document(

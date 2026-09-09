@@ -11,3 +11,4 @@ uploads/
 .DS_Store
 .git
 .gitignore
+.env

@@ -1,5 +1,5 @@
 # Stage 1: Build dependencies
-FROM python:3.11-slim as builder
+FROM python:3.11.10-slim-bookworm AS builder
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
@@ -20,7 +20,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 
 # Stage 2: Minimal runtime
-FROM python:3.11-slim as runner
+FROM python:3.11.10-slim-bookworm AS runner
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -47,6 +47,10 @@ RUN mkdir -p /app/uploads /uploads && chown -R appuser:appgroup /app /uploads
 # Copy application source code
 COPY --chown=appuser:appgroup . /app
 
+# Point d'entrée : migrations Alembic puis démarrage d'uvicorn
+COPY --chown=appuser:appgroup entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
 USER appuser
 
 EXPOSE 8000
@@ -54,4 +58,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+ENTRYPOINT ["/app/entrypoint.sh"]

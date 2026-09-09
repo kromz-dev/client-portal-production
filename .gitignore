@@ -22,3 +22,17 @@ frontend/node_modules/
 __pycache__/
 *.py[cod]
 .venv/
+
+# Secrets (clés age, identités privées, etc.)
+secrets/
+
+# Copies de sécurité des uploads créées avant une restauration
+uploads.pre-restore_*
+
+# Fichiers temporaires dechiffres par scripts/restore.sh (normalement shred -u).
+.restore_db.*
+.restore_uploads.*
+
+# Mesures / relevés générés localement (on garde seulement le .gitkeep)
+docs/mesures/*
+!docs/mesures/.gitkeep

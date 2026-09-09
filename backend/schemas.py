@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -54,13 +54,13 @@ class DocumentResponse(BaseModel):
 class ProjectCreate(BaseModel):
     title: str = Field(..., min_length=1, max_length=255)
     description: Optional[str] = None
-    status: Optional[str] = Field(default="En cours", max_length=50)
+    status: Optional[Literal["En attente", "En cours", "Terminé"]] = "En cours"
 
 
 class ProjectUpdate(BaseModel):
     title: Optional[str] = Field(None, min_length=1, max_length=255)
     description: Optional[str] = None
-    status: Optional[str] = Field(None, max_length=50)
+    status: Optional[Literal["En attente", "En cours", "Terminé"]] = None
 
 
 class ProjectResponse(BaseModel):

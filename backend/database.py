@@ -1,11 +1,9 @@
-import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://postgres:postgres@localhost:5432/portail_client"
-)
+from config import settings
+
+DATABASE_URL = settings.database_url
 
 # SQLAlchemy 2.0 requires postgresql:// instead of postgres://
 if DATABASE_URL.startswith("postgres://"):
@@ -26,5 +24,8 @@ def get_db():
     db = SessionLocal()
     try:
         yield db
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()

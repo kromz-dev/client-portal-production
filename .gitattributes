@@ -1,0 +1,20 @@
+# Le dépôt est édité sous Windows mais exécuté sous Linux (Debian/Proxmox).
+# Sans cette règle, Git convertit les scripts en CRLF au checkout et le shebang
+# `#!/usr/bin/env bash\r` devient introuvable : « bad interpreter ».
+* text=auto eol=lf
+
+*.sh            text eol=lf
+Dockerfile      text eol=lf
+Caddyfile       text eol=lf
+*.service       text eol=lf
+*.timer         text eol=lf
+*.conf          text eol=lf
+.env.example    text eol=lf
+
+# Fichiers binaires : aucune conversion.
+*.png           binary
+*.jpg           binary
+*.pdf           binary
+*.dump          binary
+*.age           binary
+*.tar.gz        binary
