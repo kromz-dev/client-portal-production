@@ -1,0 +1,89 @@
+# =============================================================================
+# Production Caddyfile - Portail Client
+# =============================================================================
+# Handles automatic HTTPS (Let's Encrypt / ZeroSSL), reverse proxying to FastAPI,
+# and high-performance static file serving with Single Page Application fallback.
+# =============================================================================
+
+{
+    # Global options
+    admin off
+}
+
+{$DOMAIN_NAME:localhost} {
+    # -------------------------------------------------------------------------
+    # Security Hardening Headers
+    # -------------------------------------------------------------------------
+    header {
+        # Strict Transport Security (HSTS) - enforce HTTPS for 1 year with subdomains
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+
+        # Prevent MIME-type sniffing
+        X-Content-Type-Options "nosniff"
+
+        # Prevent clickjacking / frame embedding
+        X-Frame-Options "DENY"
+
+        # Referrer Policy: send full referrer for same-origin, origin only across domains
+        Referrer-Policy "strict-origin-when-cross-origin"
+
+        # Restrict browser APIs and hardware features
+        Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=(), vr=()"
+
+        # Content Security Policy (allows self-hosted scripts, styles, images, and API fetch)
+        Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; frame-ancestors 'none';"
+
+        # Cross-Origin Protection
+        Cross-Origin-Opener-Policy "same-origin"
+        Cross-Origin-Resource-Policy "same-origin"
+
+        # Remove Server header to minimize fingerprinting
+        -Server
+    }
+
+    # -------------------------------------------------------------------------
+    # Performance & Compression
+    # -------------------------------------------------------------------------
+    encode zstd gzip
+
+    # -------------------------------------------------------------------------
+    # API Endpoints (/api/*)
+    # -------------------------------------------------------------------------
+    handle /api/* {
+        reverse_proxy backend:8000 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+            header_up X-Forwarded-Host {host}
+        }
+    }
+
+    # -------------------------------------------------------------------------
+    # Health Check Endpoint (/health)
+    # -------------------------------------------------------------------------
+    handle /health {
+        reverse_proxy backend:8000
+    }
+
+    # -------------------------------------------------------------------------
+    # Static Frontend SPA Serving (/srv/dist)
+    # -------------------------------------------------------------------------
+    handle {
+        root * /srv/dist
+        try_files {path} /index.html
+        file_server {
+            # Enable precompressed static files if available (.gz, .zst)
+            precompressed gzip zstd
+        }
+    }
+
+    # -------------------------------------------------------------------------
+    # Structured Logging
+    # -------------------------------------------------------------------------
+    log {
+        output stdout
+        format console
+        level INFO
+    }
+}

@@ -1,0 +1,24 @@
+# Environment variables (contains production secrets)
+.env
+
+# Backups
+backups/*
+!backups/.gitkeep
+
+# Uploads directory contents
+uploads/*
+!uploads/.gitkeep
+
+# Temporary files
+*.tmp
+*.log
+.DS_Store
+
+# Frontend build artifacts
+frontend/dist/
+frontend/node_modules/
+
+# Python / Backend
+__pycache__/
+*.py[cod]
+.venv/

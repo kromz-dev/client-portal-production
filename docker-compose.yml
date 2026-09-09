@@ -1,0 +1,112 @@
+services:
+  # =========================================================================
+  # Database Service: PostgreSQL 16
+  # =========================================================================
+  db:
+    image: postgres:16-alpine
+    container_name: portail_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Error: POSTGRES_PASSWORD must be set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-portail_client}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - backend_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-portail_client}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    # Security: Database is isolated inside backend_net and NOT exposed to host ports
+    security_opt:
+      - no-new-privileges:true
+
+  # =========================================================================
+  # Backend API Service: FastAPI
+  # =========================================================================
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: portail_backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-portail_client}
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-portail_client}
+      SECRET_KEY: ${SECRET_KEY:?Error: SECRET_KEY must be set in .env}
+      DOMAIN_NAME: ${DOMAIN_NAME:-localhost}
+      UPLOAD_DIR: /uploads
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+    volumes:
+      - ./uploads:/uploads
+    networks:
+      - frontend_net
+      - backend_net
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    security_opt:
+      - no-new-privileges:true
+
+  # =========================================================================
+  # Reverse Proxy & TLS: Caddy
+  # =========================================================================
+  caddy:
+    image: caddy:alpine
+    container_name: portail_caddy
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_started
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp" # HTTP/3 (QUIC) support
+    environment:
+      DOMAIN_NAME: ${DOMAIN_NAME:-localhost}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./frontend/dist:/srv/dist:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - frontend_net
+    security_opt:
+      - no-new-privileges:true
+
+# =========================================================================
+# Networks Definition (Security Isolation)
+# =========================================================================
+networks:
+  # Internal network: only backend and db can communicate; no public routing
+  backend_net:
+    driver: bridge
+    internal: true
+  # Frontend network: Caddy communicates with backend
+  frontend_net:
+    driver: bridge
+
+# =========================================================================
+# Persistent Volumes
+# =========================================================================
+volumes:
+  pgdata:
+    name: portail_pgdata
+  caddy_data:
+    name: portail_caddy_data
+  caddy_config:
+    name: portail_caddy_config
