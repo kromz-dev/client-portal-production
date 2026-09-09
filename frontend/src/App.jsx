@@ -204,10 +204,10 @@ export default function App() {
             projectId={selectedProjectId}
             user={user}
             onBack={leaveProject}
-            onProjectChanged={() => {
-              loadProjects();
-              setSelectedProjectId(null);
-            }}
+            /* Signale que la fiche a changé : on rafraîchit la liste en
+               arrière-plan sans quitter le projet. La suppression, elle,
+               appelle `onBack` de son côté. */
+            onProjectChanged={loadProjects}
             onNotify={notify}
           />
         ) : (
