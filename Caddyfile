@@ -8,6 +8,9 @@
 {
     # Global options
     admin off
+
+    # Adresse de contact pour Let's Encrypt / ZeroSSL (definie dans .env)
+    email {$CADDY_EMAIL}
 }
 
 {$DOMAIN_NAME:localhost} {
@@ -47,6 +50,15 @@
     encode zstd gzip
 
     # -------------------------------------------------------------------------
+    # Plafond de taille des requetes
+    # -------------------------------------------------------------------------
+    # Volontairement au-dessus de la limite applicative (10 Mio) : l'application
+    # renvoie son 413 JSON propre, Caddy ne coupe que les corps vraiment abusifs.
+    request_body {
+        max_size 12MB
+    }
+
+    # -------------------------------------------------------------------------
     # API Endpoints (/api/*)
     # -------------------------------------------------------------------------
     handle /api/* {
@@ -67,15 +79,10 @@
     }
 
     # -------------------------------------------------------------------------
-    # Static Frontend SPA Serving (/srv/dist)
+    # Frontend SPA : proxy vers le conteneur web (Nginx)
     # -------------------------------------------------------------------------
     handle {
-        root * /srv/dist
-        try_files {path} /index.html
-        file_server {
-            # Enable precompressed static files if available (.gz, .zst)
-            precompressed gzip zstd
-        }
+        reverse_proxy web:80
     }
 
     # -------------------------------------------------------------------------

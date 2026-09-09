@@ -346,7 +346,11 @@ export default function App() {
                     <div style={{ display: 'flex', gap: '0.5rem' }}>
                       <button
                         className="btn btn-secondary btn-sm"
-                        onClick={() => api.downloadDocument(currentProject.id, doc.id, doc.filename)}
+                        onClick={() =>
+                          api
+                            .downloadDocument(currentProject.id, doc.id, doc.filename)
+                            .catch((err) => alert(err.message || 'Erreur lors du téléchargement'))
+                        }
                       >
                         Télécharger
                       </button>

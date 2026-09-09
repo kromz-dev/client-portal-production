@@ -128,8 +128,23 @@ export const api = {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
 
+    // Cohérence avec le helper request() : purge du jeton sur 401 et
+    // remontée du message « detail » renvoyé par le backend
+    if (response.status === 401) {
+      clearToken();
+    }
+
     if (!response.ok) {
-      throw new Error('Impossible de télécharger le document');
+      let errorDetail = 'Impossible de télécharger le document';
+      try {
+        const errData = await response.json();
+        errorDetail = errData.detail || JSON.stringify(errData);
+      } catch {
+        errorDetail = `Erreur HTTP ${response.status}: ${response.statusText}`;
+      }
+      const error = new Error(errorDetail);
+      error.status = response.status;
+      throw error;
     }
 
     const blob = await response.blob();

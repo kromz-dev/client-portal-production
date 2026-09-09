@@ -1,0 +1,21 @@
+# =============================================================================
+# portail-backup.service
+# -----------------------------------------------------------------------------
+# Execute une sauvegarde chiffree (scripts/backup.sh) : pg_dump -Fc + archive
+# des uploads, chiffres avec age, puis rotation de retention.
+#
+# Unite « oneshot » declenchee par portail-backup.timer (pas d'activation
+# directe). La sortie est envoyee au journal : « journalctl -u portail-backup ».
+# Le chemin /opt/portail_client est code en dur.
+# =============================================================================
+[Unit]
+Description=Portail Client - sauvegarde chiffree quotidienne (base + uploads)
+After=docker.service network-online.target portail-client.service
+Wants=portail-client.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/portail_client
+ExecStart=/opt/portail_client/scripts/backup.sh
+StandardOutput=journal
+StandardError=journal

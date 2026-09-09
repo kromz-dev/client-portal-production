@@ -1,0 +1,21 @@
+# =============================================================================
+# portail-backup.timer
+# -----------------------------------------------------------------------------
+# Declenche portail-backup.service chaque jour a 02:00 (heure locale de l'hote).
+#
+# Persistent=true : si l'hote etait eteint a 02:00, la sauvegarde manquee est
+# lancee au prochain demarrage. C'est ce qui garantit reellement l'objectif
+# RPO < 24 h annonce dans le RUNBOOK.
+#
+# Installation : ./scripts/install-timers.sh
+# =============================================================================
+[Unit]
+Description=Portail Client - planification de la sauvegarde quotidienne (02:00)
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+Persistent=true
+Unit=portail-backup.service
+
+[Install]
+WantedBy=timers.target

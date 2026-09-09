@@ -1,220 +1,281 @@
 #!/usr/bin/env bash
 # =============================================================================
-# backup.sh - Production Database & Uploads Backup with 7-Day Retention
+# backup.sh - Sauvegarde chiffree de la base de donnees et des uploads
 # =============================================================================
-# Performs:
-#   1. pg_dump in custom compressed format (-Fc) directly from PostgreSQL container
-#   2. Compressed archive (.tar.gz) of the uploads directory
-#   3. Automatic verification of backup file sizes and integrity
-#   4. 7-day retention rotation policy (deletes archives older than retention threshold)
-#   5. Timestamped, audit-ready logging with duration metrics
+# Operations realisees :
+#   1. pg_dump au format compresse personnalise (-Fc) depuis le conteneur
+#      PostgreSQL
+#   2. Archive compressee (.tar.gz) du repertoire uploads/
+#   3. Verification de la taille et de l'entete des fichiers produits
+#   4. Chiffrement de chaque artefact avec `age` (cle publique X25519) :
+#      aucune sauvegarde en clair n'est conservee sur le disque
+#   5. Rotation de retention (suppression des archives plus vieilles que le
+#      seuil), y compris les anciens fichiers en clair d'avant le chiffrement
+#   6. Rapport horodate et pret pour l'audit, avec metriques de duree
+#
+# Ce script s'execute sans surveillance (timer systemd) : il utilise donc une
+# cle publique age et jamais une phrase de passe interactive.
 # =============================================================================
 
 set -euo pipefail
 
-# ANSI Colors
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-BLUE='\033[0;34m'
-BOLD='\033[1m'
-NC='\033[0m'
-
-# Determine Paths
+# ANSI / journalisation / detection Compose (fonctions partagees)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/_lib.sh
+source "${SCRIPT_DIR}/_lib.sh"
+
+# Determination des chemins
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BACKUP_DIR="${PROJECT_ROOT}/backups"
 TIMESTAMP="$(date +"%Y%m%d_%H%M%S")"
 START_TIME="$(date +%s)"
 
-# Logging function with ISO-8601-like timestamp
-log() {
-    local level="$1"; shift
-    local color="$NC"
-    case "$level" in
-        INFO)  color="$BLUE" ;;
-        OK)    color="$GREEN" ;;
-        WARN)  color="$YELLOW" ;;
-        ERROR) color="$RED" ;;
-    esac
-    echo -e "$(date +'%Y-%m-%d %H:%M:%S') [${color}${level}${NC}] $*"
-}
-
 HELP_INVOKED=false
 
-# Cleanup & Exit Trap
+# Artefacts en clair a supprimer imperativement si le script meurt en cours de
+# chiffrement : une sauvegarde non chiffree ne doit jamais survivre a un echec.
+DB_PLAINTEXT=""
+UPLOADS_PLAINTEXT=""
+
+# Piege de sortie / nettoyage
 cleanup() {
     local exit_code=$?
     if [[ "${HELP_INVOKED:-false}" = true ]]; then
         return 0
     fi
-    local end_time="$(date +%s)"
+
+    # Suppression des intermediaires en clair eventuellement laisses en place
+    for leftover in "$DB_PLAINTEXT" "$UPLOADS_PLAINTEXT"; do
+        if [[ -n "$leftover" && -f "$leftover" ]]; then
+            log WARN "Suppression de l'intermediaire en clair : $(basename "$leftover")"
+            rm -f "$leftover"
+        fi
+    done
+
+    local end_time; end_time="$(date +%s)"
     local duration=$((end_time - START_TIME))
 
     if [[ $exit_code -eq 0 ]]; then
-        log OK "Backup completed successfully in ${duration}s."
+        log OK "Sauvegarde terminee avec succes en ${duration}s."
     else
-        log ERROR "Backup failed with exit code ${exit_code} after ${duration}s!"
+        log ERROR "Echec de la sauvegarde (code ${exit_code}) apres ${duration}s !"
     fi
 }
 trap cleanup EXIT
 
-# Parse help flag
+# Analyse de l'option d'aide
 for arg in "$@"; do
     case "$arg" in
         -h|--help)
             HELP_INVOKED=true
-            echo "Usage: $0 [OPTIONS]"
+            echo "Usage : $0 [OPTIONS]"
             echo ""
-            echo "Automated PostgreSQL custom dump (-Fc) and uploads archive with 7-day retention rotation."
+            echo "Sauvegarde PostgreSQL (pg_dump -Fc) et archive des uploads, chiffrees"
+            echo "avec age, suivies d'une rotation de retention."
             echo ""
-            echo "Options:"
-            echo "  -h, --help    Show this help message"
+            echo "Options :"
+            echo "  -h, --help    Affiche cette aide"
             exit 0
             ;;
     esac
 done
 
 # -----------------------------------------------------------------------------
-# 1. Environment & Preflight Checks
+# 1. Environnement et verifications prealables
 # -----------------------------------------------------------------------------
-log INFO "Starting backup procedure from ${PROJECT_ROOT}"
+log INFO "Demarrage de la procedure de sauvegarde depuis ${PROJECT_ROOT}"
 
-# Load environment variables if .env exists
+# Chargement des variables d'environnement si .env existe
 ENV_FILE="${PROJECT_ROOT}/.env"
 if [[ -f "$ENV_FILE" ]]; then
-    log INFO "Loading configuration from .env"
-    # Export only non-comment, valid variable assignments safely
+    log INFO "Chargement de la configuration depuis .env"
     set -a
     # shellcheck disable=SC1090
     source "$ENV_FILE"
     set +a
 else
-    log WARN ".env file not found at ${ENV_FILE}. Falling back to default values."
+    log WARN "Fichier .env introuvable a ${ENV_FILE}. Utilisation des valeurs par defaut."
 fi
 
-# Set defaults
+# Valeurs par defaut
 POSTGRES_USER="${POSTGRES_USER:-postgres}"
 POSTGRES_DB="${POSTGRES_DB:-portail_client}"
 POSTGRES_CONTAINER="${POSTGRES_CONTAINER:-portail_db}"
 RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-7}"
 
-# Check Docker Compose command
-if command -v docker &>/dev/null && docker compose version &>/dev/null; then
-    DOCKER_COMPOSE="docker compose"
-elif command -v docker-compose &>/dev/null; then
-    DOCKER_COMPOSE="docker-compose"
-else
-    log ERROR "Docker or Docker Compose is not installed or not in PATH."
+# Chiffrement obligatoire : destinataire age
+if [[ -z "${BACKUP_AGE_RECIPIENT:-}" ]]; then
+    log ERROR "BACKUP_AGE_RECIPIENT n'est pas defini dans .env."
+    log ERROR "Aucune sauvegarde en clair ne sera produite."
+    log ERROR "Executez d'abord : ./scripts/install.sh (genere la cle et affiche la cle publique age1...)."
     exit 1
 fi
 
-# Ensure backup directory exists with restricted permissions (0700)
+# Binaire age requis
+if ! command -v age &>/dev/null; then
+    log ERROR "Le binaire 'age' est introuvable. Installez-le : sudo apt-get install -y age"
+    exit 1
+fi
+
+# Detection de la commande Docker Compose
+detect_compose
+
+# Repertoire de sauvegarde avec permissions restreintes (0700)
 mkdir -p "$BACKUP_DIR"
 chmod 700 "$BACKUP_DIR"
 
 # -----------------------------------------------------------------------------
-# 2. Database Health Verification
+# 2. Verification de l'etat de la base de donnees
 # -----------------------------------------------------------------------------
-log INFO "Verifying PostgreSQL container status (${POSTGRES_CONTAINER})..."
+log INFO "Verification de l'etat du conteneur PostgreSQL (${POSTGRES_CONTAINER})..."
 
 if ! $DOCKER_COMPOSE -f "${PROJECT_ROOT}/docker-compose.yml" ps --services --filter "status=running" | grep -q "^db$"; then
-    log ERROR "Database service 'db' (${POSTGRES_CONTAINER}) is not running."
+    log ERROR "Le service de base de donnees 'db' (${POSTGRES_CONTAINER}) n'est pas en cours d'execution."
     exit 1
 fi
 
 if ! $DOCKER_COMPOSE -f "${PROJECT_ROOT}/docker-compose.yml" exec -T db pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" &>/dev/null; then
-    log ERROR "PostgreSQL is running but not accepting connections for user '$POSTGRES_USER' and db '$POSTGRES_DB'."
+    log ERROR "PostgreSQL fonctionne mais n'accepte pas les connexions pour l'utilisateur '$POSTGRES_USER' et la base '$POSTGRES_DB'."
     exit 1
 fi
-log OK "PostgreSQL database is healthy and ready for dump."
+log OK "La base de donnees PostgreSQL est saine et prete pour le dump."
 
 # -----------------------------------------------------------------------------
-# 3. PostgreSQL Database Backup (pg_dump -Fc)
+# 3. Sauvegarde de la base de donnees (pg_dump -Fc) puis chiffrement
 # -----------------------------------------------------------------------------
-DB_BACKUP_FILE="${BACKUP_DIR}/db_${POSTGRES_DB}_${TIMESTAMP}.dump"
-log INFO "Dumping database '${POSTGRES_DB}' into ${DB_BACKUP_FILE}..."
+DB_DUMP_FILE="${BACKUP_DIR}/db_${POSTGRES_DB}_${TIMESTAMP}.dump"
+DB_ENC_FILE="${DB_DUMP_FILE}.age"
+log INFO "Dump de la base '${POSTGRES_DB}' vers ${DB_DUMP_FILE}..."
 
-# Use custom format (-Fc) for compression, BLOB support, and granular restore options
+# On marque l'artefact en clair AVANT sa creation pour que le piege puisse le
+# nettoyer meme si le dump echoue a mi-parcours.
+DB_PLAINTEXT="$DB_DUMP_FILE"
+
+# Format personnalise (-Fc) : compression, gestion des BLOB, restauration fine
 $DOCKER_COMPOSE -f "${PROJECT_ROOT}/docker-compose.yml" exec -T db \
     pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc --no-owner --no-privileges \
-    > "$DB_BACKUP_FILE"
+    > "$DB_DUMP_FILE"
 
-# Validate DB dump file
-if [[ ! -s "$DB_BACKUP_FILE" ]]; then
-    log ERROR "Database backup file is empty or was not created: ${DB_BACKUP_FILE}"
-    rm -f "$DB_BACKUP_FILE"
+# Validation du dump en clair (l'entete PGDMP est encore lisible a ce stade)
+if [[ ! -s "$DB_DUMP_FILE" ]]; then
+    log ERROR "Le fichier de sauvegarde de la base est vide ou n'a pas ete cree : ${DB_DUMP_FILE}"
     exit 1
 fi
 
-# Verify header begins with PGDMP magic bytes (0x50 0x47 0x44 0x4D 0x50)
-HEADER=$(head -c 5 "$DB_BACKUP_FILE" || true)
+HEADER=$(head -c 5 "$DB_DUMP_FILE" || true)
 if [[ "$HEADER" != "PGDMP" ]]; then
-    log ERROR "Backup file header does not match PostgreSQL custom dump format (got '$HEADER')."
-    rm -f "$DB_BACKUP_FILE"
+    log ERROR "L'entete du fichier ne correspond pas au format dump personnalise PostgreSQL (obtenu '$HEADER')."
+    exit 1
+fi
+log OK "Dump de la base valide (entete PGDMP)."
+
+# Chiffrement avec la cle publique age
+log INFO "Chiffrement du dump avec age -> $(basename "$DB_ENC_FILE")"
+rm -f "$DB_ENC_FILE"
+age -r "$BACKUP_AGE_RECIPIENT" -o "$DB_ENC_FILE" "$DB_DUMP_FILE"
+rm -f "$DB_DUMP_FILE"
+DB_PLAINTEXT=""
+
+# Verification de l'artefact chiffre
+if [[ ! -s "$DB_ENC_FILE" ]]; then
+    log ERROR "Le fichier chiffre est vide : ${DB_ENC_FILE}"
+    rm -f "$DB_ENC_FILE"
+    exit 1
+fi
+ENC_HEADER=$(head -c 21 "$DB_ENC_FILE" || true)
+if [[ "$ENC_HEADER" != "age-encryption.org/v1" ]]; then
+    log ERROR "L'entete du fichier chiffre n'est pas 'age-encryption.org/v1' (obtenu '$ENC_HEADER')."
+    rm -f "$DB_ENC_FILE"
     exit 1
 fi
 
-DB_SIZE=$(du -h "$DB_BACKUP_FILE" | cut -f1)
-log OK "Database backup verified: ${DB_BACKUP_FILE} (${DB_SIZE})"
+DB_SIZE=$(du -h "$DB_ENC_FILE" | cut -f1)
+log OK "Sauvegarde de la base chiffree et verifiee : ${DB_ENC_FILE} (${DB_SIZE})"
 
 # -----------------------------------------------------------------------------
-# 4. Uploads Volume Backup
+# 4. Sauvegarde du volume uploads puis chiffrement
 # -----------------------------------------------------------------------------
 UPLOADS_DIR="${PROJECT_ROOT}/uploads"
-UPLOADS_BACKUP_FILE="${BACKUP_DIR}/uploads_${TIMESTAMP}.tar.gz"
+UPLOADS_TAR_FILE="${BACKUP_DIR}/uploads_${TIMESTAMP}.tar.gz"
+UPLOADS_ENC_FILE="${UPLOADS_TAR_FILE}.age"
 
 if [[ -d "$UPLOADS_DIR" ]]; then
-    log INFO "Archiving uploads from ${UPLOADS_DIR}..."
-    tar -czf "$UPLOADS_BACKUP_FILE" -C "$PROJECT_ROOT" uploads
+    log INFO "Archivage des uploads depuis ${UPLOADS_DIR}..."
+    UPLOADS_PLAINTEXT="$UPLOADS_TAR_FILE"
+    tar -czf "$UPLOADS_TAR_FILE" -C "$PROJECT_ROOT" uploads
 
-    if [[ -s "$UPLOADS_BACKUP_FILE" ]]; then
-        UPLOADS_SIZE=$(du -h "$UPLOADS_BACKUP_FILE" | cut -f1)
-        log OK "Uploads archive verified: ${UPLOADS_BACKUP_FILE} (${UPLOADS_SIZE})"
+    if [[ -s "$UPLOADS_TAR_FILE" ]]; then
+        log INFO "Chiffrement de l'archive uploads avec age -> $(basename "$UPLOADS_ENC_FILE")"
+        rm -f "$UPLOADS_ENC_FILE"
+        age -r "$BACKUP_AGE_RECIPIENT" -o "$UPLOADS_ENC_FILE" "$UPLOADS_TAR_FILE"
+        rm -f "$UPLOADS_TAR_FILE"
+        UPLOADS_PLAINTEXT=""
+
+        if [[ ! -s "$UPLOADS_ENC_FILE" ]]; then
+            log ERROR "L'archive uploads chiffree est vide : ${UPLOADS_ENC_FILE}"
+            rm -f "$UPLOADS_ENC_FILE"
+            exit 1
+        fi
+        UP_ENC_HEADER=$(head -c 21 "$UPLOADS_ENC_FILE" || true)
+        if [[ "$UP_ENC_HEADER" != "age-encryption.org/v1" ]]; then
+            log ERROR "L'entete de l'archive uploads chiffree n'est pas 'age-encryption.org/v1' (obtenu '$UP_ENC_HEADER')."
+            rm -f "$UPLOADS_ENC_FILE"
+            exit 1
+        fi
+
+        UPLOADS_SIZE=$(du -h "$UPLOADS_ENC_FILE" | cut -f1)
+        log OK "Archive uploads chiffree et verifiee : ${UPLOADS_ENC_FILE} (${UPLOADS_SIZE})"
     else
-        log WARN "Uploads archive was created but is empty."
+        log WARN "L'archive uploads a ete creee mais elle est vide. Suppression."
+        rm -f "$UPLOADS_TAR_FILE"
+        UPLOADS_PLAINTEXT=""
     fi
 else
-    log WARN "No uploads directory found at ${UPLOADS_DIR}. Skipping upload archive."
+    log WARN "Aucun repertoire uploads trouve a ${UPLOADS_DIR}. Archive des uploads ignoree."
 fi
 
 # -----------------------------------------------------------------------------
-# 5. Retention Policy (7-Day Rotation)
+# 5. Politique de retention (rotation)
 # -----------------------------------------------------------------------------
-log INFO "Applying ${RETENTION_DAYS}-day backup retention rotation..."
+log INFO "Application de la rotation de retention sur ${RETENTION_DAYS} jours..."
 
-# Find and remove expired DB dumps
-EXPIRED_DB=$(find "$BACKUP_DIR" -type f -name "db_*.dump" -mtime +"$RETENTION_DAYS" || true)
-if [[ -n "$EXPIRED_DB" ]]; then
-    while IFS= read -r file; do
-        log INFO "Purging expired database dump: $(basename "$file")"
-        rm -f "$file"
-    done <<< "$EXPIRED_DB"
-fi
+purge_expired() {
+    local pattern="$1" label="$2" expired
+    expired=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name "$pattern" -mtime +"$RETENTION_DAYS" || true)
+    if [[ -n "$expired" ]]; then
+        while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
+            log INFO "Purge ${label} expire : $(basename "$file")"
+            rm -f "$file"
+        done <<< "$expired"
+    fi
+}
 
-# Find and remove expired uploads archives
-EXPIRED_UPLOADS=$(find "$BACKUP_DIR" -type f -name "uploads_*.tar.gz" -mtime +"$RETENTION_DAYS" || true)
-if [[ -n "$EXPIRED_UPLOADS" ]]; then
-    while IFS= read -r file; do
-        log INFO "Purging expired uploads archive: $(basename "$file")"
-        rm -f "$file"
-    done <<< "$EXPIRED_UPLOADS"
-fi
+# Artefacts chiffres courants
+purge_expired "db_*.dump.age"       "du dump de base"
+purge_expired "uploads_*.tar.gz.age" "de l'archive uploads"
+# Anciens artefacts en clair d'avant le chiffrement : une installation mise a
+# jour se nettoie ainsi d'elle-meme.
+purge_expired "db_*.dump"           "du dump de base (ancien format en clair)"
+purge_expired "uploads_*.tar.gz"    "de l'archive uploads (ancien format en clair)"
 
 # -----------------------------------------------------------------------------
-# 6. Summary Report
+# 6. Rapport de synthese
 # -----------------------------------------------------------------------------
 TOTAL_BACKUPS_SIZE=$(du -sh "$BACKUP_DIR" | cut -f1)
-BACKUP_COUNT=$(find "$BACKUP_DIR" -type f \( -name "*.dump" -o -name "*.tar.gz" \) | wc -l)
+BACKUP_COUNT=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "*.age" -o -name "*.dump" -o -name "*.tar.gz" \) | wc -l)
 
 echo -e "\n${BOLD}======================================================${NC}"
-echo -e "${BOLD}               Backup Summary Report                  ${NC}"
+echo -e "${BOLD}            Rapport de synthese - Sauvegarde           ${NC}"
 echo -e "${BOLD}======================================================${NC}"
-echo "  - Database Dump:    ${DB_BACKUP_FILE} (${DB_SIZE})"
-if [[ -f "$UPLOADS_BACKUP_FILE" ]]; then
-echo "  - Uploads Archive:  ${UPLOADS_BACKUP_FILE} (${UPLOADS_SIZE})"
+echo "  - Dump base (chiffre) : ${DB_ENC_FILE} (${DB_SIZE})"
+if [[ -f "$UPLOADS_ENC_FILE" ]]; then
+echo "  - Archive uploads (chiffree) : ${UPLOADS_ENC_FILE} (${UPLOADS_SIZE:-?})"
 fi
-echo "  - Total Archives:   ${BACKUP_COUNT} files in ${BACKUP_DIR}"
-echo "  - Total Disk Usage: ${TOTAL_BACKUPS_SIZE}"
-echo "  - Retention Window: ${RETENTION_DAYS} days"
+echo "  - Total archives : ${BACKUP_COUNT} fichiers dans ${BACKUP_DIR}"
+echo "  - Espace disque total : ${TOTAL_BACKUPS_SIZE}"
+echo "  - Fenetre de retention : ${RETENTION_DAYS} jours"
+echo "  - Chiffrement : age (X25519), destinataire ${BACKUP_AGE_RECIPIENT}"
+echo -e "  ${YELLOW}Rappel : la restauration exige l'identite privee age"
+echo -e "  (secrets/backup_age.key). Sans elle, AUCUNE sauvegarde n'est recuperable.${NC}"
 echo -e "${BOLD}======================================================${NC}\n"
